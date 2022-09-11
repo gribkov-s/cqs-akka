@@ -1,27 +1,21 @@
-import akka.NotUsed
+import akka.{NotUsed, actor}
 import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
 import akka.actor.typed.{ActorSystem, Props, _}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior, RetentionCriteria}
-import akka.NotUsed
+import akka.{NotUsed, actor}
 import akka.actor.typed.scaladsl.{ActorContext, Behaviors}
 import akka.actor.typed.{ActorSystem, Props, _}
 import akka.persistence.cassandra.query.scaladsl.CassandraReadJournal
-import akka.persistence.query.journal.leveldb.scaladsl.LeveldbReadJournal
 import akka.persistence.query.{EventEnvelope, PersistenceQuery}
 import akka.persistence.typed.PersistenceId
-import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
-import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.Source
-import akka.actor.typed.ActorSystem
-import akka.actor.typed.scaladsl.Behaviors
-import akka_typed.CalculatorRepository.{getLatestOffsetAndResult, initDataBase, updateResultAndOfsset}
-import akka_typed.TypedCalculatorWriteSide.{Add, Added, Command, Divide, Divided, Multiplied, Multiply}
-
-import scala.concurrent.duration._
-import scala.io.StdIn
-import scala.util.{Failure, Success}
-
+import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior, RetentionCriteria}
+import akka.stream.alpakka.slick.scaladsl.{Slick, SlickSession}
+import akka.stream.scaladsl.{Flow, RunnableGraph, Sink, Source}
+import slick.jdbc.H2Profile.api._
+import scala.concurrent.Await
+import scala.concurrent.duration.DurationInt
+import akka_typed.TypedCalculatorWriteSide._
 
 
 case class Action(value: Int, name: String)
@@ -116,74 +110,53 @@ object akka_typed
   }
 
   case class TypedCalculatorReadSide(system: ActorSystem[NotUsed]) {
-    initDataBase
 
-    implicit val materializer            = system.classicSystem
-    var (offset, latestCalculatedResult) = getLatestOffsetAndResult
-    val startOffset: Int                 = if (offset == 1) 1 else offset + 1
+    implicit val session: SlickSession = SlickSession.forConfig("slick-postgres")
+    implicit val materializer: actor.ActorSystem = system.classicSystem
 
-//    val readJournal: LeveldbReadJournal =
+    var (offset, latestCalculatedResult) =
+     Await.result(
+       session.db.run(
+         sql"select write_side_offset, calculated_value from public.result where id = 1".as[(Int, Double)]
+       ),
+       30.seconds
+     ).head
+
+    val startOffset: Int = if (offset == 1) 1 else offset + 1
+
     val readJournal: CassandraReadJournal =
       PersistenceQuery(system).readJournalFor[CassandraReadJournal](CassandraReadJournal.Identifier)
 
     val source: Source[EventEnvelope, NotUsed] = readJournal
       .eventsByPersistenceId("001", startOffset, Long.MaxValue)
 
-    source
-      .map{x =>
-        println(x.toString())
-        x
-      }
-      .runForeach { event =>
+    val flowUpdateRes: Flow[EventEnvelope, EventEnvelope, NotUsed] = Flow[EventEnvelope].map { event =>
       event.event match {
         case Added(_, amount) =>
-//          println(s"!Before Log from Added: $latestCalculatedResult")
           latestCalculatedResult += amount
-          updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
           println(s"! Log from Added: $latestCalculatedResult")
         case Multiplied(_, amount) =>
-//          println(s"!Before Log from Multiplied: $latestCalculatedResult")
           latestCalculatedResult *= amount
-          updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
           println(s"! Log from Multiplied: $latestCalculatedResult")
         case Divided(_, amount) =>
-//          println(s"! Log from Divided before: $latestCalculatedResult")
           latestCalculatedResult /= amount
-          updateResultAndOfsset(latestCalculatedResult, event.sequenceNr)
           println(s"! Log from Divided: $latestCalculatedResult")
       }
+      event
     }
+
+    val flowWriteRes: Flow[EventEnvelope, Int, NotUsed] = Slick.flow(event =>
+      sqlu"UPDATE public.result SET calculated_value=${latestCalculatedResult}, write_side_offset=${event.sequenceNr} WHERE id= 1 "
+    )
+
+    val runnableGraph: RunnableGraph[NotUsed] =
+      source.async
+      .via(flowUpdateRes).async
+      .via(flowWriteRes).async
+      .to(Sink.ignore)
+
+    runnableGraph.run()
   }
-
-  object CalculatorRepository {
-    import scalikejdbc._
-
-    def initDataBase: Unit = {
-      Class.forName("org.postgresql.Driver")
-      val poolSettings = ConnectionPoolSettings(initialSize = 10, maxSize = 100)
-
-      ConnectionPool.singleton("jdbc:postgresql://localhost:5432/demo", "docker", "docker", poolSettings)
-    }
-
-    def getLatestOffsetAndResult: (Int, Double) = {
-      val entities =
-        DB readOnly { session =>
-          session.list("select * from public.result where id = 1;") {
-            row => (row.int("write_side_offset"), row.double("calculated_value")) }
-        }
-      entities.head
-    }
-
-    def updateResultAndOfsset(calculated: Double, offset: Long): Unit = {
-      using(DB(ConnectionPool.borrow())) { db =>
-        db.autoClose(true)
-        db.localTx {
-          _.update("update public.result set calculated_value = ?, write_side_offset = ? where id = ?", calculated, offset, 1)
-        }
-      }
-    }
-  }
-
 
   def apply(): Behavior[NotUsed] =
     Behaviors.setup { ctx =>
@@ -211,7 +184,7 @@ object akka_typed
     val value = akka_typed()
     implicit val system: ActorSystem[NotUsed] = ActorSystem(value, "akka_typed")
 
-//    TypedCalculatorReadSide(system)
+    TypedCalculatorReadSide(system)
 
     implicit val executionContext = system.executionContext
   }
