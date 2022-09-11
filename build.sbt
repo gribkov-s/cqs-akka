@@ -26,6 +26,15 @@ libraryDependencies ++= Seq(
   "com.typesafe.akka" %% "akka-actor-typed"       % akkaVersion,
   "com.typesafe.akka" %% "akka-persistence-typed" % akkaVersion,
   "com.typesafe.akka" %% "akka-persistence-query" % akkaVersion,
+  "com.typesafe.akka" %% "akka-stream" % akkaVersion,
+
+  "com.typesafe.akka" %% "akka-coordination" % akkaVersion,
+  "com.typesafe.akka" %% "akka-cluster" % akkaVersion,
+  "com.typesafe.akka" %% "akka-cluster-tools" % akkaVersion,
+  
+  "com.typesafe.slick" %% "slick" % "3.3.3",
+  "com.typesafe.slick" %% "slick-hikaricp" % "3.3.3",
+  "com.lightbend.akka" %% "akka-stream-alpakka-slick" % "3.0.3",
 
 
   //  local levelDB stores
